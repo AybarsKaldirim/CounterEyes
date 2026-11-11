@@ -1,0 +1,16 @@
+Counter Eyes — third-party components
+
+1) MediaPipe FaceLandmarker
+   Files: assets/www/vendor/mediapipe/ (face_landmarker.task, vision_bundle.mjs, wasm/)
+   License: Apache License 2.0 — https://github.com/google-ai-edge/mediapipe
+   The model file is redistributed unmodified.
+
+2) qrcode.js
+   File: assets/www/vendor/qrcode.js
+   License: MIT — Copyright (c) Kazuhiko Arase
+   https://github.com/kazuhikoarase/qrcode-generator
+
+3) Robot voice, idle gestures, eye contact and the Canvas eye renderer in
+   assets/www/ are original work of this project (MIT, see LICENSE).
+
+No POS vendor SDK, API key or customer data is bundled with this repository.

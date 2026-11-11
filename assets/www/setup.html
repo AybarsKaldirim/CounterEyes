@@ -1,0 +1,216 @@
+<!DOCTYPE html>
+<html lang="tr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Counter Eyes — kurulum</title>
+<style>
+  :root { --bg:#0b0f10; --panel:#141a1c; --line:#22303a; --txt:#e6f1f3; --dim:#8fa3ac; --accent:#33e866; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--txt); font:15px/1.5 -apple-system,"Segoe UI",Roboto,sans-serif; }
+  .wrap { max-width:960px; margin:0 auto; padding:22px 20px 40px; }
+  h1 { font-size:20px; margin:0 0 4px; }
+  h1 span { color:var(--accent); }
+  p.lead { color:var(--dim); margin:0 0 18px; font-size:13px; }
+  fieldset { border:1px solid var(--line); border-radius:12px; background:var(--panel); margin:0 0 14px; padding:12px 14px; }
+  legend { color:var(--accent); font-size:12px; text-transform:uppercase; letter-spacing:1px; padding:0 6px; }
+  label { display:block; font-size:12.5px; color:var(--dim); margin:10px 0 4px; }
+  input, select { width:100%; background:#0d1315; color:var(--txt); border:1px solid var(--line);
+    border-radius:8px; padding:10px 11px; font-size:14px; }
+  input:focus, select:focus { outline:1px solid var(--accent); border-color:var(--accent); }
+  .row { display:flex; gap:12px; flex-wrap:wrap; }
+  .row > div { flex:1 1 200px; }
+  .hint { color:var(--dim); font-size:11.5px; margin-top:4px; }
+  .actions { display:flex; gap:10px; flex-wrap:wrap; margin-top:18px; align-items:center; }
+  button { border-radius:10px; padding:12px 18px; font-size:14px; font-weight:600; border:1px solid var(--line);
+    background:#182124; color:var(--txt); }
+  button.primary { background:var(--accent); color:#04140a; border-color:var(--accent); }
+  button:disabled { opacity:.5; }
+  #result { margin-top:14px; font-size:13px; min-height:20px; color:var(--dim); }
+  #result.ok { color:var(--accent); }
+  #result.err { color:#ff7b72; }
+  .sec { display:none; }
+  .sec.active { display:block; }
+  .note { font-size:11.5px; color:var(--dim); border-left:2px solid var(--line); padding-left:10px; margin-top:10px; }
+  a { color:var(--accent); }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Counter <span>Eyes</span></h1>
+  <p class="lead">Tablet kasa gözleri · kasa bağlantısı ve yorum QR kurulumu — <em>setup</em></p>
+
+  <fieldset>
+    <legend>1 · Kasa türü / POS type</legend>
+    <label for="provider">Kasa sistemi</label>
+    <select id="provider">
+      <option value="simpra">Simpra (hazır adaptör)</option>
+      <option value="http">Genel HTTP/JSON — herhangi bir kasa veya ara servis</option>
+      <option value="demo">Demo — kasa yok, QR'ı elle tetikle</option>
+    </select>
+    <div class="hint">Her kasa türü için ayrı kod gerekmez: genel HTTP/JSON modunda kendi adresini ve alanlarını tanımlarsın.</div>
+  </fieldset>
+
+  <fieldset class="sec" id="secSimpra">
+    <legend>Simpra bağlantısı</legend>
+    <label for="simpraUrl">API adresi (boş bırakılırsa api.simpra.app/checks)</label>
+    <input id="simpraUrl" placeholder="https://api.simpra.app/checks" autocomplete="off">
+    <label for="simpraToken">Simpra Access Token</label>
+    <input id="simpraToken" type="password" placeholder="••••••••" autocomplete="off">
+    <div class="hint">Anahtar cihazda Android Keystore ile şifrelenir; APK içinde veya dışa aktarımda yer almaz.</div>
+  </fieldset>
+
+  <fieldset class="sec" id="secHttp">
+    <legend>Genel HTTP/JSON bağlantısı</legend>
+    <label for="httpUrl">Son kapanışları döndüren adres (GET)</label>
+    <input id="httpUrl" placeholder="http://192.168.1.50:8080/last-closures" autocomplete="off">
+    <div class="row">
+      <div>
+        <label for="headerName">Başlık adı (isteğe bağlı)</label>
+        <input id="headerName" placeholder="Authorization" autocomplete="off">
+      </div>
+      <div>
+        <label for="headerValue">Başlık değeri (isteğe bağlı)</label>
+        <input id="headerValue" type="password" placeholder="Bearer …" autocomplete="off">
+      </div>
+    </div>
+    <div class="row">
+      <div>
+        <label for="itemsPath">Dizi yolu</label>
+        <input id="itemsPath" placeholder="data.checks  (kök dizi ise boş bırak)" autocomplete="off">
+      </div>
+      <div>
+        <label for="closedAtField">Kapanış zamanı alanı</label>
+        <input id="closedAtField" placeholder="closed_at" autocomplete="off">
+      </div>
+    </div>
+    <div class="row">
+      <div>
+        <label for="idField">Kayıt kimliği alanı</label>
+        <input id="idField" placeholder="id" autocomplete="off">
+      </div>
+      <div>
+        <label for="amountField">Tutar alanı (isteğe bağlı)</label>
+        <input id="amountField" placeholder="total_amount" autocomplete="off">
+      </div>
+    </div>
+    <div class="hint">Zaman saniye, milisaniye veya ISO-8601 olabilir. Uygulama yalnız okur; kasa verisini değiştirmez.</div>
+  </fieldset>
+
+  <fieldset>
+    <legend>2 · Yorum QR</legend>
+    <label for="reviewUrl">Yorum bağlantısı (boşsa QR gösterilmez)</label>
+    <input id="reviewUrl" placeholder="https://search.google.com/local/writereview?placeid=…" autocomplete="off">
+    <div class="row">
+      <div>
+        <label for="pollMs">Yoklama aralığı (ms)</label>
+        <input id="pollMs" type="number" min="2000" max="60000" step="500" value="5000">
+      </div>
+      <div>
+        <label for="includeZero">0 TL / ikram kapanışları</label>
+        <select id="includeZero">
+          <option value="true">QR gösterilsin</option>
+          <option value="false">Atla</option>
+        </select>
+      </div>
+    </div>
+  </fieldset>
+
+  <div class="actions">
+    <button id="test">Bağlantıyı dene</button>
+    <button id="start" class="primary">Kaydet ve başlat</button>
+    <button id="open">Uygulamaya dön</button>
+  </div>
+  <div id="result"></div>
+  <div class="note">Kurulumu sonradan değiştirmek için uygulamada sağ üstteki ⚙ düğmesine dokun.
+    Bu sayfa yalnız yerel dosyaları kullanır; ayarlar cihazda kalır.</div>
+</div>
+
+<script>
+(function () {
+  const $ = id => document.getElementById(id);
+  const result = $("result");
+  let saved = {};
+
+  function setResult(text, kind) {
+    result.textContent = text || "";
+    result.className = kind || "";
+  }
+
+  window.ceTestResult = message => setResult(message, /hata|error/i.test(message) ? "err" : "ok");
+
+  window.ceInit = json => {
+    try { saved = JSON.parse(json); } catch (err) { saved = {}; }
+    $("provider").value = saved.provider || "simpra";
+    $("simpraUrl").value = saved.provider === "simpra" ? (saved.url || "") : "";
+    $("httpUrl").value = saved.provider === "http" ? (saved.url || "") : "";
+    $("headerName").value = saved.headerName || "";
+    $("itemsPath").value = saved.itemsPath || "";
+    $("idField").value = saved.idField || "id";
+    $("closedAtField").value = saved.closedAtField || "closed_at";
+    $("amountField").value = saved.amountField || "";
+    $("reviewUrl").value = saved.reviewUrl || "";
+    $("pollMs").value = saved.pollMs || 5000;
+    $("includeZero").value = saved.includeZero === false ? "false" : "true";
+    $("simpraToken").value = "";
+    $("headerValue").value = "";
+    if (saved.tokenSaved) $("simpraToken").placeholder = "kayıtlı (değiştirmek için yaz)";
+    if (saved.headerSaved) $("headerValue").placeholder = "kayıtlı (değiştirmek için yaz)";
+    sync();
+  };
+
+  function sync() {
+    const provider = $("provider").value;
+    $("secSimpra").classList.toggle("active", provider === "simpra");
+    $("secHttp").classList.toggle("active", provider === "http");
+  }
+  $("provider").addEventListener("change", sync);
+  sync();
+
+  function payload() {
+    const provider = $("provider").value;
+    const body = {
+      provider: provider,
+      url: provider === "simpra" ? $("simpraUrl").value.trim() : $("httpUrl").value.trim(),
+      headerName: $("headerName").value.trim(),
+      itemsPath: $("itemsPath").value.trim(),
+      idField: $("idField").value.trim(),
+      closedAtField: $("closedAtField").value.trim(),
+      amountField: $("amountField").value.trim(),
+      reviewUrl: $("reviewUrl").value.trim(),
+      pollMs: Number($("pollMs").value) || 5000,
+      includeZero: $("includeZero").value === "true"
+    };
+    if (provider === "simpra" && !body.url) body.url = "https://api.simpra.app/checks";
+    const token = $("simpraToken").value.trim();
+    const header = $("headerValue").value.trim();
+    if (token) body.token = token;
+    if (header) body.headerValue = header;
+    return body;
+  }
+
+  function bridgeReady() { return typeof window.CE !== "undefined"; }
+
+  $("test").addEventListener("click", () => {
+    if (!bridgeReady()) { setResult("Uygulama köprüsü bulunamadı (tarayıcıda önizleme).", "err"); return; }
+    setResult("Deneniyor…");
+    CE.test(JSON.stringify(payload()));
+  });
+
+  $("start").addEventListener("click", () => {
+    if (!bridgeReady()) { setResult("Uygulama köprüsü bulunamadı (tarayıcıda önizleme).", "err"); return; }
+    const answer = CE.save(JSON.stringify(payload()));
+    if (answer !== "ok") { setResult(answer || "Kaydedilemedi", "err"); return; }
+    setResult("Kaydedildi, uygulama başlıyor…", "ok");
+    setTimeout(() => CE.open(), 400);
+  });
+
+  $("open").addEventListener("click", () => {
+    if (!bridgeReady()) { setResult("Uygulama köprüsü yok.", "err"); return; }
+    CE.open();
+  });
+
+})();
+</script>
+</body>
+</html>

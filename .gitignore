@@ -1,0 +1,17 @@
+# derleme çıktıları
+build-*/
+*.apk
+*.idsig
+# imza anahtarı ve sırlar (asla commit edilmez)
+*.keystore
+*.jks
+*.p12
+counter-eyes.keystore
+# araçlar
+node_modules/
+.venv/
+simulator-venv/
+__pycache__/
+*.pyc
+.DS_Store
+Thumbs.db

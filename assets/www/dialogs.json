@@ -1,0 +1,56 @@
+{
+  "counter": [
+    "Hoş geldin! Bugün ne içiyoruz?",
+    "Hoş geldin, seni gördüğüme sevindim.",
+    "Hoş geldin! Kahve mi, yoksa macera mı?",
+    "Selam! Günün nasıl gidiyor?",
+    "Hoş geldin, buyur. Ben buradayım, sen karar ver.",
+    "Gel bakalım, bugün ne arzu edersin?",
+    "Hoş geldin! Menüyü ezbere biliyorum, istediğini sor.",
+    "Merhaba! Bugün latte mi, filtre mi?",
+    "Hoş geldin. Yüzün gülüyor, iyi bir gün olacak.",
+    "Selam! Kasanın arkasından selam veriyorum."
+  ],
+  "passerby": [
+    "Merhaba!",
+    "Selam, geçerken uğramışsın.",
+    "Merhaba! Acele etme, ben beklerim.",
+    "Selam! Bir kahveye vaktin var mı?",
+    "Merhaba, geçen herkesi görüyorum.",
+    "Selam! Yolun düşerse buradayım.",
+    "Merhaba! Beni gördün, günün güzel geçsin.",
+    "Selam! Kapıdan girene göz kırpıyorum."
+  ],
+  "stare": [
+    "Bakışlarını hissediyorum, biliyorsun.",
+    "Bana bu kadar bakarsan utanırım.",
+    "Ne oldu, yüzümde kahve mi var?",
+    "İyi misin? Uzun uzun baktın da.",
+    "Ben de sana bakıyorum, berabere.",
+    "Bir şey mi sormak istedin?",
+    "Gözlerimi takip etmek yorucu, değil mi?",
+    "Bakışma yarışması mı yapıyoruz?"
+  ],
+  "review": [
+    "Afiyet olsun! Deneyimini paylaşır mısın?",
+    "Afiyet olsun. İki saniyeni alır, yorum yazar mısın?",
+    "Afiyet olsun! Bir yorum, bir kahve kadar iyi gelir.",
+    "Umarım keyifliydi. QR'a bir bakar mısın?",
+    "Afiyet olsun! Bize bir cümle bırakır mısın?",
+    "Teşekkürler! Yorumun bize çok iyi gelir, QR burada.",
+    "Afiyet olsun. Kamerayı QR'a tut, gerisi kolay.",
+    "Güle güle! Gitmeden bir yorum bırakır mısın?"
+  ],
+  "idle": [
+    "Kimse yok, ben de kendi kendime konuşuyorum.",
+    "Kahve kokusu buraya kadar geliyor.",
+    "Bugün biraz sessiz, ben de bekliyorum.",
+    "Not aldım: gözlerim açık, uyanığım.",
+    "Buraya biri gelse iyi olurdu.",
+    "Kasa arkasında nöbetteyim.",
+    "Bazen sadece bakıyorum, sorun değil.",
+    "Latte sesi duydum sanki.",
+    "Bekliyorum, acelem yok.",
+    "Bir müşteri gelse, gözlerimle selam veririm."
+  ]
+}

@@ -1,0 +1,1422 @@
+<!doctype html>
+<html lang="tr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>localhost — kasa gözü</title>
+<meta name="theme-color" content="#0b0208">
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; background: #0b0208; overflow: hidden; }
+  body {
+    font-family: "Ubuntu Mono", ui-monospace, monospace;
+    color: #EEEEEC;
+    touch-action: none;
+    -webkit-user-select: none; user-select: none;
+    cursor: none;
+  }
+  #stage {
+    position: fixed; inset: 0;
+    width: 100vw; height: 100vh;
+    display: block;
+  }
+  .pill {
+    position: fixed; left: 50%; bottom: 18px; transform: translateX(-50%);
+    display: flex; gap: 10px; align-items: center;
+    padding: 7px 14px; border-radius: 999px;
+    background: rgba(61,18,48,.55);
+    border: 1px solid rgba(238,238,236,.10);
+    backdrop-filter: blur(6px);
+    font-size: 13px; letter-spacing: .04em; color: #c9b7c1;
+    transition: opacity .4s ease;
+  }
+  .dot { width: 7px; height: 7px; border-radius: 50%; background: #8a7a83; }
+  .dot.live { background: #8AE234; box-shadow: 0 0 10px #8AE23488; }
+  .dot.warn { background: #E95420; box-shadow: 0 0 10px #E9542088; }
+  .hidden { opacity: 0; pointer-events: none; }
+  #rotate {
+    position: fixed; inset: 0; display: none; place-items: center;
+    background: #0b0208; font-size: 15px; color: #c9b7c1; text-align: center; padding: 24px;
+  }
+  @media (orientation: portrait) and (max-width: 900px) {
+    #rotate { display: grid; }
+  }
+</style>
+</head>
+<body>
+<canvas id="stage"></canvas>
+<div class="pill hidden" id="pill"><span class="dot" id="dot"></span><span id="status">kamera kapalı</span></div>
+<div id="rotate">Tableti yatay çevir.</div>
+
+<script src="vendor/qrcode.js"></script>
+<script type="module">
+import { RobotVoice } from "/vendor/robot-voice.mjs";
+import { IdleAnimator, IDLE_GESTURES, drawIdleAccents } from "/vendor/idle-gestures.mjs";
+import { ContactAffection, drawContactHearts, smoothContactTarget } from "/vendor/contact-hearts.mjs";
+/* ------------------------------------------------------------------
+   localhost — kasa gözü / göz motoru prototipi
+   - İki robot göz, canvas üzerine çizilir.
+   - Ön kamera varsa MediaPipe FaceLandmarker ile yüz aranır,
+     gözler müşteriyi takip eder; yoksa idle davranışı sürer.
+   - Klavye: c = kamerayı aç/kapa, p = durum çubuğu, d = demo bakış.
+   ------------------------------------------------------------------ */
+
+/* Ayarlar uygulamadan (kurulum ekranı) gelir; sabit işletme linki yoktur. */
+const appConfig = (() => {
+  try { return window.CE ? JSON.parse(CE.config()) : {}; } catch (err) { return {}; }
+})();
+const CFG = {
+  reviewUrl: appConfig.reviewUrl || '',
+  reviewUrlFallback: '',
+  reviewShowMs: 30000,
+  reviewLine: 'Afiyet olsun! Deneyimini bizimle paylaşır mısın?',
+  eyeSpacing: 0.145,       // ekran genişliğine oranla merkezden uzaklık
+  gazeGain: 2.0,           // kamera→ekran bakış kazancı
+  pairDriftX: 0.030,       // göz çiftinin yatay kayması (ekran genişliği oranı)
+  pairDriftY: 0.020,       // dikey kayma
+  idleLookDelay: 6,        // saniye: yüz yokken ilgi düşer
+  followLerp: 0.34,        // takip yumuşaklığı (0-1)
+  saccadeLerp: 0.055,
+  detectEveryMs: 55,       // yüz tespit sıklığı
+  faceLockGraceMs: 850,   // kısa kayıpta hedefi koru
+  predictS: 0.10,          // bakış hedefini ileri taşıma (saniye)
+
+  // --- selamlama senaryosu
+  greetDwellS: 0.9,        // yüz bu kadar kalırsa selamla
+  greetCooldownS: 12,      // iki selam arası en az (sn)
+  samePersonS: 10,         // aynı kişi dönünce tekrar etme
+  counterWidth: 0.16,      // yüz genişliği bundan büyükse "kasa önü"
+  greetPerMinute: 5,       // dakikada en çok
+  greetPauseS: 25,         // limit aşılırsa susma süresi
+  greetPasserby: ['Merhaba!', 'Merhaba, hoş geldiniz!'],
+  greetCounter: 'Hoş geldiniz!',
+
+  // --- insani göz hareketi
+  pursuitTau: 0.11,        // yumuşak takip zaman sabiti (sn)
+  saccadeTau: 0.045,       // büyük atlamada daha hızlı
+  pupilTau: 0.30,          // göz bebeği büyüme/küçülme yumuşaklığı
+  blinkMeanS: 3.4,         // ortalama kırpma aralığı
+  eyeContactYaw: 0.32,
+  eyeContactPitch: 0.38,
+  eyeContactEnterMs: 160,  // tek bir kare temas başlatmasın
+  eyeContactHoldMs: 240,   // kısa kırpma teması kesmesin
+  eyeContactTau: 0.065,
+};
+
+const QS = new URLSearchParams(location.search);
+const DEBUG = QS.has('debug');
+
+/* kamera merkezi (otomatik kalibrasyon): kamera solda olduğu için öğrenilir */
+const CAL = {
+  cx: 0.5, cy: 0.42, stable: 0, n: 0, at: 0, sampleAt: 0,
+  locked: false, minW: 0.16, maxW: 0.34, maxN: 60,
+  session: 0, maxPerSession: 6,
+};
+try {
+  const saved = JSON.parse(localStorage.getItem('kasaGoz.calib') || 'null');
+  if (saved && Number.isFinite(saved.cx)) {
+    CAL.cx = saved.cx; CAL.cy = saved.cy; CAL.n = saved.n || 0;
+    CAL.locked = Boolean(saved.locked);
+  }
+} catch { /* yok */ }
+function saveCal() {
+  try {
+    localStorage.setItem('kasaGoz.calib', JSON.stringify({
+      cx: CAL.cx, cy: CAL.cy, n: CAL.n, locked: CAL.locked,
+    }));
+  } catch { /* yok */ }
+}
+
+const canvas = document.getElementById('stage');
+const ctx = canvas.getContext('2d', { alpha: false });
+const pill = document.getElementById('pill');
+const dot = document.getElementById('dot');
+const statusEl = document.getElementById('status');
+
+let W = 0, H = 0, DPR = 1;
+
+const state = {
+  t: 0,
+  lastFrame: performance.now(),
+  gaze: { x: 0, y: 0 },          // -1..1 hedef yön
+  gazeTarget: { x: 0, y: 0 },
+  blink: 0,                       // 0 açık, 1 kapalı
+  nextBlink: 2.5,
+  face: null,                     // {x,y,w,h,score} normalize
+  pupil: 0.4,                     // 0..1 göz bebeği büyüklüğü
+  eyeContact: false,
+  eyeContactSince: null,
+  eyeContactSeenAt: 0,
+  faceTarget: 0,
+  contactGaze: null,
+  contactEmotion: null,
+  customerGaze: null,             // {h,v,yaw,pitch}
+  microAt: 0, microX: 0, microY: 0,
+  doubleBlink: 0,
+  faceSeenAt: -99,
+  attention: 0,                   // 0..1
+  mode: 'idle',                   // idle | tracking | speaking
+  nextSaccade: 1.2,
+  speaking: 0,
+  greetPulse: 0,
+  lastPhrase: '',
+  lastPhraseAt: -99,
+  subtitle: '',
+  voiceElapsed: 0,
+  voiceDuration: 0,
+  voicePulse: 0,
+  idlePose: null,
+  captionWords: [],
+  subLayout: null,
+  subShift: 0,
+  panel: 0,               // 0 = sadece gözler, 1 = QR paneli
+  review: false,
+  reviewUntil: 0,
+  statusText: 'kamera kapalı',
+};
+
+/* ---------- QR ---------- */
+let qrMatrix = null, qrSize = 0;
+function buildQR() {
+  qrMatrix = null; qrSize = 0;
+  if (!CFG.reviewUrl) { console.warn('[qr] yorum bağlantısı tanımlı değil'); return; }
+  try {
+    const qr = qrcode(0, 'M');
+    qr.addData(CFG.reviewUrl);
+    qr.make();
+    qrSize = qr.getModuleCount();
+    qrMatrix = Array.from({ length: qrSize }, (_, y) =>
+      Array.from({ length: qrSize }, (_, x) => qr.isDark(y, x)));
+  } catch (err) { console.warn('[qr]', err); }
+}
+buildQR();
+
+/* Robot sesi ve altyazı aynı ses zaman çizelgesini kullanır. */
+const robotVoice = new RobotVoice();
+let lastVoiceSrc = 'robot';
+let speechSession = null;
+const idleAnimator = new IdleAnimator();
+const contactAffection = new ContactAffection();
+let idleVoiceSession = null;
+let lastRobotReaction = -99;
+let robotHadFace = false;
+
+function unlockAudio() {
+  robotVoice.unlock().catch(() => {});
+}
+
+function speak(text, opts = {}) {
+  cancelIdleAnimation();
+  speechSession = robotVoice.speak(text, opts);
+  state.subtitle = text;
+  state.captionWords = speechSession.plan.captions;
+  state.voiceDuration = speechSession.plan.duration;
+  state.voiceElapsed = -.045;
+  state.subLayout = null;
+  state.speaking = speechSession.plan.duration;
+  state.lastPhrase = text;
+  state.lastPhraseAt = state.t;
+  lastVoiceSrc = 'robot · ' + speechSession.plan.intent;
+}
+
+function robotReact(intent, force = false) {
+  const busy = speechSession && speechSession.elapsed() < speechSession.plan.duration + .15;
+  if (!force && (busy || state.review || state.t - lastRobotReaction < 8)) return;
+  speechSession = robotVoice.react(intent);
+  state.subtitle = '';
+  state.captionWords = [];
+  state.subLayout = null;
+  state.voiceDuration = speechSession.plan.duration;
+  state.voiceElapsed = -.045;
+  lastRobotReaction = state.t;
+  lastVoiceSrc = 'tepki · ' + intent;
+}
+
+function updateRobotVoice(dt, hasFace) {
+  state.voicePulse = 0;
+  if (speechSession) {
+    const elapsed = speechSession.elapsed();
+    state.voiceElapsed = elapsed;
+    for (const segment of speechSession.plan.segments) {
+      const age = elapsed - segment.at;
+      if (age >= 0 && age < segment.duration) {
+        state.voicePulse = Math.max(state.voicePulse, Math.sin(Math.PI * age / segment.duration));
+      }
+    }
+  }
+  const subOn = state.subtitle && state.voiceElapsed < state.voiceDuration + 1.2 ? 1 : 0;
+  state.subShift = lerp(state.subShift, subOn, smooth(.16, dt));
+  if (hasFace && !robotHadFace) robotReact('curious');
+
+  robotHadFace = Boolean(hasFace);
+}
+
+function cancelIdleAnimation() {
+  idleAnimator.active = null;
+  state.idlePose = null;
+  if (idleVoiceSession && speechSession === idleVoiceSession) {
+    robotVoice.stop();
+    speechSession = null;
+    state.voicePulse = 0;
+  }
+  idleVoiceSession = null;
+}
+
+function previewIdleAnimation(kind) {
+  if (state.face || state.review) return false;
+  if (!idleAnimator.preview(kind, state.t)) return false;
+  robotReact(IDLE_GESTURES[kind].sound, true);
+  idleVoiceSession = speechSession;
+  state.subtitle = '';
+  state.subShift = 0;
+  return true;
+}
+
+function updateIdleAnimation(hasFace) {
+  const otherSpeech = speechSession && speechSession !== idleVoiceSession &&
+    speechSession.elapsed() < speechSession.plan.duration + (state.subtitle ? 1.2 : .15);
+  const hasLock = Boolean(lockedFace && performance.now() - lockedFaceAt < CFG.faceLockGraceMs);
+  const result = idleAnimator.update(state.t, {
+    hasFace: Boolean(hasFace), hasLock, review: state.review || state.panel > .02,
+    speaking: Boolean(otherSpeech),
+  });
+  state.idlePose = result.pose;
+  if (result.interrupted && idleVoiceSession && speechSession === idleVoiceSession) {
+    robotVoice.stop();
+    speechSession = null;
+    state.voicePulse = 0;
+    idleVoiceSession = null;
+  }
+  if (result.started) {
+    robotReact(IDLE_GESTURES[result.started].sound, true);
+    idleVoiceSession = speechSession;
+  }
+}
+
+
+/* ---------- diyalog kataloğu (doğal, tekrar etmeyen) ---------- */
+let DIALOGS = null;
+const recentLines = [];
+
+async function loadDialogs() {
+  try {
+    DIALOGS = await fetch('/dialogs.json', { cache: 'no-store' }).then(response => response.json());
+    console.log('[dialog] hazır');
+  } catch (error) { console.warn('[dialog]', error); }
+}
+
+function pickLine(cat) {
+  const list = (DIALOGS && DIALOGS[cat]) || [];
+  if (!list.length) return '';
+  const fresh = list.filter((t) => !recentLines.includes(t));
+  const pool = fresh.length ? fresh : list;
+  const text = pool[(Math.random() * pool.length) | 0];
+  recentLines.push(text);
+  while (recentLines.length > 18) recentLines.shift();
+  return text;
+}
+
+/* bakışma (uzun bakan) ve boşta mırıldanma durumları */
+const stare = { since: 0, at: -99, done: false };
+let idleNext = 0;
+
+/* ---------- selamlama senaryosu ---------- */
+const greet = { seenAt: 0, maxW: 0, done: false, lastAt: -99, times: [], pauseUntil: 0 };
+
+function tryGreet() {
+  const t = state.t;
+  greet.done = true;
+  if (state.review) return console.log('[greet] panel açık, sus');
+  if (t < greet.pauseUntil) return console.log('[greet] duraklatma');
+  if (t - greet.lastAt < CFG.greetCooldownS) return console.log('[greet] bekleme');
+  greet.times = greet.times.filter((x) => t - x < 60);
+  if (greet.times.length >= CFG.greetPerMinute) {
+    greet.pauseUntil = t + CFG.greetPauseS;
+    return console.log('[greet] dakika limiti');
+  }
+  const atCounter = greet.maxW >= CFG.counterWidth;
+  const text = atCounter
+    ? (pickLine('counter') || CFG.greetCounter)
+    : (pickLine('passerby') || CFG.greetPasserby[0]);
+  speak(text);
+  greet.lastAt = t;
+  greet.times.push(t);
+  state.greetPulse = 1;
+  state.lastPhrase = text;
+  state.lastPhraseAt = t;
+  console.log('[greet]', atCounter ? 'kasa' : 'geçen', '"' + text + '"', 'w=' + greet.maxW.toFixed(2));
+}
+
+function updateGreeting(hasFace, faceAge) {
+  const f = state.face;
+  if (hasFace && f) {
+    if (!greet.seenAt) {
+      greet.seenAt = state.t;
+      greet.maxW = f.w;
+      greet.done = false;
+    } else {
+      greet.maxW = Math.max(greet.maxW, f.w);
+    }
+    if (!greet.done && state.t - greet.seenAt >= CFG.greetDwellS) tryGreet();
+  } else if (faceAge > 1.5) {
+    greet.seenAt = 0;
+  }
+
+  if (!hasFace && faceAge > 1.5) {
+    CAL.session = 0;
+    CAL.stable = 0;
+  }
+}
+
+/* ---------- kasa köprüsü (Simpra olayları) ---------- */
+let bridgeState = 'bağlanıyor';
+let lastReviewShownAt = -99;
+
+function connectBridge() {
+  bridgeState = 'tablet hazır';
+  window.counterEyes = {
+    review(test) {
+      if (!test && !qrMatrix) return;
+      if (!test && state.t - lastReviewShownAt < 8) return;
+      if (!test) lastReviewShownAt = state.t;
+      bridgeState = test ? 'QR denemesi' : 'kasa kapanışı';
+      showReview();
+    },
+    config(json) {
+      try {
+        const next = JSON.parse(json);
+        if (typeof next.reviewUrl === 'string') { CFG.reviewUrl = next.reviewUrl; buildQR(); }
+      } catch (err) { console.warn('[config]', err); }
+    },
+    status(text) { bridgeState = text; },
+    runtime() {
+      return { fps: stat.fps, inferenceMs: stat.detMs, model: stat.model,
+        audio: robotVoice.context?.state || 'off', hasFace: Boolean(state.face) };
+    },
+    enableAudio() {
+      robotVoice.unlock().then(() => {
+        console.log('[audio] ' + (robotVoice.context?.state || 'unavailable'));
+      }).catch(() => console.warn('[audio] ilk dokunuş bekleniyor'));
+    },
+  };
+}
+
+/* bakışma ve boşta mırıldanma */
+function updateMood(hasFace, faceAge) {
+  if (hasFace) {
+    if (!stare.since) stare.since = state.t;
+  } else if (faceAge > 2) {
+    stare.since = 0;
+    stare.done = false;
+  }
+
+  if (hasFace && stare.since && !stare.done && !state.review &&
+      state.t - stare.since > 7 && state.t - stare.at > 40 && state.attention > 0.6) {
+    stare.done = true;
+    stare.at = state.t;
+    const line = pickLine('stare');
+    if (line) {
+      speak(line);
+      state.lastPhrase = line;
+      state.lastPhraseAt = state.t;
+      state.greetPulse = 0.7;
+    }
+  }
+
+  if (!hasFace && faceAge > 20 && !state.review && !idleAnimator.active && state.t > idleNext) {
+    idleNext = state.t + 60 + Math.random() * 60;
+    const line = pickLine('idle');
+    if (line) {
+      speak(line, { volume: 0.55 });
+      state.lastPhrase = line;
+      state.lastPhraseAt = state.t;
+    }
+  }
+}
+
+function showReview() {
+  state.review = true;
+  state.reviewUntil = state.t + CFG.reviewShowMs / 1000;
+  const line = pickLine('review') || CFG.reviewLine;
+  speak(line, { intent: 'review' });
+  state.lastPhrase = line;
+  state.lastPhraseAt = state.t;
+  state.greetPulse = 1;
+}
+function hideReview() { state.review = false; }
+
+/* ---------- kamera + yüz tespiti ---------- */
+let landmarker = null, video = null, stream = null, camReady = false;
+let lastDetect = 0, detErrors = 0, camStarting = false;
+
+const stat = { model: 'off', face: false, detMs: 0, fps: 0, cam: '', err: '' };
+let frameCount = 0, fpsAt = 0;
+
+async function initCamera() {
+  if (camStarting) return;
+  camStarting = true;
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({
+      video: { facingMode: 'user', width: { ideal: 1280 }, height: { ideal: 720 } },
+      audio: false,
+    });
+    video = document.createElement('video');
+    video.srcObject = stream;
+    video.muted = true; video.playsInline = true;
+    await video.play();
+    await new Promise((r) => {
+      if (video.videoWidth) return r();
+      video.addEventListener('loadedmetadata', r, { once: true });
+      setTimeout(r, 1500);
+    });
+    camReady = true;
+    stat.cam = video.videoWidth + '×' + video.videoHeight;
+    console.log('[cam] hazır', stat.cam);
+    if (!landmarker) await loadModel();
+  } catch (err) {
+    stat.err = (err?.name || 'hata');
+    console.warn('[cam]', err);
+  } finally {
+    camStarting = false;
+    statusTick(true);
+  }
+}
+
+async function loadModel() {
+  stat.model = 'loading';
+  statusTick(true);
+  try {
+    const vision = await import('/vendor/mediapipe/vision_bundle.mjs');
+    const fileset = await vision.FilesetResolver.forVisionTasks('/vendor/mediapipe/wasm');
+    const opts = (delegate) => ({
+      baseOptions: { modelAssetPath: '/vendor/mediapipe/face_landmarker.task', delegate },
+      runningMode: 'VIDEO',
+      numFaces: 2,
+      outputFaceBlendshapes: false,
+      minFaceDetectionConfidence: 0.4,
+      minTrackingConfidence: 0.4,
+    });
+    try {
+      landmarker = await vision.FaceLandmarker.createFromOptions(fileset, opts('GPU'));
+    } catch (gpuErr) {
+      console.warn('[model] GPU yok, CPU deneniyor', gpuErr?.message || gpuErr);
+      landmarker = await vision.FaceLandmarker.createFromOptions(fileset, opts('CPU'));
+    }
+    stat.model = 'ready';
+    console.log('[model] hazır');
+  } catch (err) {
+    landmarker = null;
+    stat.model = 'error';
+    stat.err = String(err?.message || err).slice(0, 90);
+    console.warn('[model]', err);
+  }
+  statusTick(true);
+}
+
+/* ---------- müşteri göz takibi (iris) ---------- */
+const IRIS = { lOuter: 33, lInner: 133, lTop: 159, lBot: 145, lIris: [468, 469, 470, 471, 472],
+               rOuter: 263, rInner: 362, rTop: 386, rBot: 374, rIris: [473, 474, 475, 476, 477] };
+
+function irisCenter(lm, idx) {
+  let x = 0, y = 0;
+  for (const i of idx) { x += lm[i].x / idx.length; y += lm[i].y / idx.length; }
+  return { x, y };
+}
+
+function gazeFromLandmarks(lm) {
+  try {
+    const li = irisCenter(lm, IRIS.lIris), ri = irisCenter(lm, IRIS.rIris);
+    // Her iki gözde de oran görüntünün solundan sağına büyür.
+    const lWidth = lm[IRIS.lInner].x - lm[IRIS.lOuter].x;
+    const rWidth = lm[IRIS.rOuter].x - lm[IRIS.rInner].x;
+    const lOpen = lm[IRIS.lBot].y - lm[IRIS.lTop].y;
+    const rOpen = lm[IRIS.rBot].y - lm[IRIS.rTop].y;
+    if (lWidth <= 0 || rWidth <= 0 || lOpen < lWidth * 0.09 || rOpen < rWidth * 0.09) return null;
+
+    const lh = (li.x - lm[IRIS.lOuter].x) / lWidth;
+    const rh = (ri.x - lm[IRIS.rInner].x) / rWidth;
+    const lv = (li.y - lm[IRIS.lTop].y) / lOpen;
+    const rv = (ri.y - lm[IRIS.rTop].y) / rOpen;
+    const h = (lh + rh) / 2, v = (lv + rv) / 2;
+    if (!Number.isFinite(h) || !Number.isFinite(v) || h < -0.5 || h > 1.5) return null;
+    return {
+      h, v,
+      yaw: clamp((h - 0.5) * 2, -1.2, 1.2),
+      pitch: clamp((v - 0.5) * 2, -1.2, 1.2),
+    };
+  } catch { return null; }
+}
+
+function updateEyeContact(gaze, now) {
+  const direct = gaze && Math.abs(gaze.yaw) < CFG.eyeContactYaw &&
+    Math.abs(gaze.pitch) < CFG.eyeContactPitch;
+  const gap = now - state.eyeContactSeenAt;
+  if (direct) {
+    if (state.eyeContactSince === null || gap >= CFG.eyeContactHoldMs) {
+      state.eyeContactSince = now;
+    }
+    state.eyeContactSeenAt = now;
+    if (!state.eyeContact && now - state.eyeContactSince >= CFG.eyeContactEnterMs) {
+      state.eyeContact = true;
+      console.log('[eye-contact] başladı');
+    }
+  } else {
+    state.eyeContactSince = null;
+    if (state.eyeContact && gap >= CFG.eyeContactHoldMs) {
+      state.eyeContact = false;
+      console.log('[eye-contact] bitti');
+    }
+  }
+}
+
+/* yumuşak takip için 120 ms gecikmeli bakış geçmişi */
+const lookHist = [];
+function pushLook(x, y) {
+  lookHist.push({ t: state.t, x, y });
+  while (lookHist.length > 120) lookHist.shift();
+}
+function lookAt(t) {
+  for (let i = lookHist.length - 1; i >= 0; i--) if (lookHist[i].t <= t) return lookHist[i];
+  return null;
+}
+
+let lastDetLog = 0;
+let lockedFace = null;
+let lockedFaceAt = 0;
+function detectFace(now) {
+  if (!landmarker || !camReady) return;
+  if (now - lastDetect < CFG.detectEveryMs) return;
+  if (video.readyState < 2 || !video.videoWidth) return;
+  lastDetect = now;
+  let res;
+  const t0 = performance.now();
+  try {
+    res = landmarker.detectForVideo(video, Math.round(now));
+  } catch (err) {
+    detErrors++;
+    if (now - lastDetLog > 3000) {
+      lastDetLog = now;
+      console.warn('[detect]', err?.message || err, 'hata sayısı', detErrors);
+    }
+    return;
+  }
+  stat.detMs = Math.round(performance.now() - t0);
+  if (lockedFace && now - lockedFaceAt >= CFG.faceLockGraceMs) {
+    lockedFace = null;
+    console.log('[face-lock] hedef bırakıldı');
+  }
+
+  let best = null;
+  let bestCost = Infinity;
+  for (const lm of res?.faceLandmarks || []) {
+    let minX = 1, maxX = 0, minY = 1, maxY = 0;
+    for (const p of lm) {
+      if (p.x < minX) minX = p.x; if (p.x > maxX) maxX = p.x;
+      if (p.y < minY) minY = p.y; if (p.y > maxY) maxY = p.y;
+    }
+    const w = maxX - minX;
+    const h = maxY - minY;
+    if (w <= 0 || h <= 0) continue;
+    const cx = (minX + maxX) / 2;
+    const cy = (minY + maxY) / 2;
+    let cost = -w; // Aynı karede ilk kez birden fazla yüz varsa en yakını seç.
+    if (lockedFace) {
+      // Mevcut hedefe yalnızca konumu ve boyutu uyumlu bir yüz bağlanabilir.
+      const dx = (cx - lockedFace.cx) / lockedFace.w;
+      const dy = (cy - lockedFace.cy) / lockedFace.h;
+      const size = Math.log(w / lockedFace.w) / Math.log(1.5);
+      cost = Math.hypot(dx * 2, dy * 2, size);
+      if (cost > 1) continue;
+    }
+    if (cost < bestCost) {
+      bestCost = cost;
+      const nose = lm[1] || lm[0];
+      best = { x: nose.x, y: nose.y, w, h, cx, cy, lm };
+    }
+  }
+
+  stat.face = Boolean(best);
+  state.face = best;
+  if (!best) return;
+
+  if (!lockedFace) {
+    lookHist.length = 0;
+    state.eyeContact = false;
+    state.eyeContactSince = null;
+    state.eyeContactSeenAt = 0;
+    state.faceTarget++;
+    state.contactGaze = null;
+    console.log('[face-lock] hedef alındı');
+  }
+  lockedFace = best;
+  lockedFaceAt = now;
+  state.faceSeenAt = state.t;
+  const g = gazeFromLandmarks(best.lm);
+  state.customerGaze = g;
+  updateEyeContact(g, now);
+  delete best.lm;
+}
+
+/* ---------- durum ---------- */
+function setStatus(text, cls = '') {
+  state.statusText = text;
+  statusEl.textContent = text;
+  dot.className = 'dot ' + cls;
+}
+
+let lastStatusAt = -1, lastFaceFlag = null;
+let lastMirrorAt = -1;
+function mirrorState() {
+  if (state.t - lastMirrorAt < 0.5) return;
+  lastMirrorAt = state.t;
+  document.body.dataset.panel = state.review ? '1' : '0';
+  document.body.dataset.bridge = bridgeState;
+  document.body.dataset.phrase = state.lastPhrase || '';
+  document.body.dataset.voice = lastVoiceSrc;
+}
+
+function statusTick(force = false) {
+  if (!force && state.t - lastStatusAt < 0.35) return;
+  lastStatusAt = state.t;
+  let text = 'kamera kapalı', cls = 'warn';
+  if (!camReady) {
+    text = stat.err ? 'kamera yok: ' + stat.err : (camStarting ? 'kamera açılıyor' : 'kamera kapalı');
+  } else if (stat.model === 'loading' || stat.model === 'off') {
+    text = 'model yükleniyor';
+  } else if (stat.model === 'error') {
+    text = 'model hatası: ' + stat.err;
+  } else if (stat.face) {
+    text = 'müşteri: takip (' + stat.detMs + ' ms)';
+    cls = 'live';
+  } else {
+    text = 'yüz aranıyor (' + stat.detMs + ' ms)';
+    cls = 'live';
+  }
+  setStatus(text, cls);
+}
+
+function togglePill() { pill.classList.toggle('hidden'); }
+
+/* ---------- matematik ---------- */
+const clamp = (v, a, b) => Math.min(b, Math.max(a, v));
+const softClamp = (v, lim) => Math.tanh(v / lim) * lim;
+const lerp = (a, b, k) => a + (b - a) * k;
+const smooth = (k, dt) => 1 - Math.pow(1 - k, dt * 60);
+
+/* ---------- güncelle ---------- */
+function update(dt) {
+  state.t += dt;
+
+  const faceAge = state.t - state.faceSeenAt;
+  const hasFace = state.face && faceAge < 0.6;
+  updateIdleAnimation(hasFace);
+  updateRobotVoice(dt, hasFace);
+  if (!hasFace) updateEyeContact(null, performance.now());
+  const eyeContact = hasFace && state.eyeContact;
+  state.contactEmotion = contactAffection.update(performance.now() / 1000, dt, {
+    target: state.faceTarget,
+    looking: Boolean(eyeContact),
+    locked: Boolean(lockedFace && performance.now() - lockedFaceAt < CFG.faceLockGraceMs),
+    review: state.review || state.panel > .02,
+  });
+
+  // dikkat: yüz görülünce yüksel, kaybolunca yavaşça düş
+  const attTarget = hasFace ? 1 : (faceAge > CFG.idleLookDelay ? 0 : 0.35);
+  state.attention = lerp(state.attention, attTarget, smooth(0.08, dt));
+
+  if (hasFace) {
+    state.mode = 'tracking';
+    const f = state.face;
+    pushLook(f.x, f.y);
+
+    // Temasta güncel yüze bak, normal takipte hareketi gecikmeyle yumuşat.
+    const target = eyeContact ? f : (lookAt(state.t - 0.12) || f);
+    const desired = {
+      x: softClamp((CAL.cx - target.x) * 2.4 * CFG.gazeGain, 1),
+      y: softClamp((target.y - CAL.cy) * 2.2 * CFG.gazeGain, 1),
+    };
+    state.contactGaze = eyeContact ? smoothContactTarget(state.contactGaze, desired, dt) : null;
+    state.gazeTarget.x = state.contactGaze ? state.contactGaze.x : desired.x;
+    state.gazeTarget.y = state.contactGaze ? state.contactGaze.y : desired.y;
+  } else if (!lockedFace || performance.now() - lockedFaceAt >= CFG.faceLockGraceMs) {
+    state.mode = 'idle';
+    if (state.t > state.nextSaccade) {
+      // sakkad dağılımı: çoğu küçük, ~%22 büyük
+      const big = Math.random() < 0.22;
+      const amp = big ? 0.35 + Math.random() * 0.5 : 0.05 + Math.random() * 0.25;
+      const a = Math.random() * Math.PI * 2;
+      state.gazeTarget.x = Math.cos(a) * amp;
+      state.gazeTarget.y = Math.sin(a) * amp * 0.7;
+      state.nextSaccade = state.t + 0.8 + Math.random() * 2.6;
+    }
+  }
+
+  mirrorState();
+  // otomatik kalibrasyon: yalnız sabit + kasa önü mesafesindeki yüz, sonra kilit
+  if (hasFace && state.face && !CAL.locked) {
+    const f = state.face;
+    const prev = state.facePrev || f;
+    const still = Math.abs(f.x - prev.x) < 0.02 && Math.abs(f.y - prev.y) < 0.02;
+    const inRange = f.w >= CAL.minW && f.w <= CAL.maxW;
+    const centered = f.cx > 0.12 && f.cx < 0.88;
+    if (still && inRange && centered) CAL.stable += dt; else CAL.stable = 0;
+
+    if (CAL.stable > 1.0 && state.t - CAL.sampleAt > 0.25 && CAL.session < CAL.maxPerSession) {
+      CAL.sampleAt = state.t;
+      const alpha = CAL.n < 40 ? 0.06 : 0.03;
+      CAL.cx = clamp(CAL.cx + (f.x - CAL.cx) * alpha, 0.18, 0.82);
+      CAL.cy = clamp(CAL.cy + (f.y - CAL.cy) * alpha, 0.30, 0.62);
+      CAL.n++;
+      CAL.session++;
+      if (CAL.n >= CAL.maxN) {
+        CAL.locked = true;
+        console.log('[calib] kilitlendi cx=' + CAL.cx.toFixed(3) + ' cy=' + CAL.cy.toFixed(3));
+      }
+      if (state.t - CAL.at > 2 || CAL.locked) { CAL.at = state.t; saveCal(); }
+    }
+  }
+
+  updateGreeting(hasFace, faceAge);
+  updateMood(hasFace, faceAge);
+  const voiceBusy = speechSession && speechSession.elapsed() < speechSession.plan.duration + .15;
+  const greetingPending = greet.seenAt && !greet.done;
+  if (state.contactEmotion.soundDue && !voiceBusy && !greetingPending && !state.review) {
+    robotReact('happy', true);
+    contactAffection.soundPlayed(performance.now() / 1000);
+  }
+  state.greetPulse = Math.max(0, state.greetPulse - dt * 0.8);
+  statusTick();
+
+  // panel aç/kapa
+  state.panel = lerp(state.panel, state.review ? 1 : 0, smooth(0.10, dt));
+  if (state.review && state.t > state.reviewUntil) hideReview();
+
+  if (state.idlePose) {
+    state.gazeTarget.x = state.idlePose.gazeX;
+    state.gazeTarget.y = state.idlePose.gazeY;
+  }
+  /* --- göz hareketi: saccade/pursuit karışımı --- */
+  const dGaze = Math.hypot(state.gazeTarget.x - state.gaze.x, state.gazeTarget.y - state.gaze.y);
+  const followTau = dGaze > 0.25 ? CFG.saccadeTau : CFG.pursuitTau * (hasFace ? 1 : 1.7);
+  const tau = eyeContact ? CFG.eyeContactTau : followTau;
+  const kGaze = 1 - Math.exp(-dt / tau);
+  state.gaze.x += (state.gazeTarget.x - state.gaze.x) * kGaze;
+  state.gaze.y += (state.gazeTarget.y - state.gaze.y) * kGaze;
+
+  // mikro sakkad + göz sürüklenmesi (drift)
+  if (state.t > state.microAt) {
+    state.microAt = state.t + 0.45 + Math.random() * 1.1;
+    state.microX = (Math.random() - 0.5) * (hasFace ? 0.012 : 0.022);
+    state.microY = (Math.random() - 0.5) * (hasFace ? 0.010 : 0.018);
+  }
+  const microEnv = eyeContact ? 0 : Math.max(0, 1 - (state.t - state.microAt + 1) * 0.6);
+  state.gaze.x += state.microX * microEnv;
+  state.gaze.y += state.microY * microEnv;
+
+  // kırpma: ortalama 3,4 sn, ara sıra çift kırpma
+  if (state.t > state.nextBlink) {
+    state.blink = 1;
+    if (Math.random() < 0.22) state.doubleBlink = state.t + 0.24;
+    state.nextBlink = state.t + CFG.blinkMeanS * (0.45 + Math.random() * 1.1);
+  }
+  if (state.doubleBlink && state.t > state.doubleBlink) {
+    state.blink = 1;
+    state.doubleBlink = 0;
+  }
+  state.blink = Math.max(0, state.blink - dt * 7);
+
+  /* --- göz bebeği: dikkat + temas + selam --- */
+  const pupilTarget = 0.34 + state.attention * 0.30 + state.greetPulse * 0.22 + state.voicePulse * 0.08 + (eyeContact ? 0.12 : 0);
+  state.pupil = lerp(state.pupil, clamp(pupilTarget, 0.25, 1), 1 - Math.exp(-dt / CFG.pupilTau));
+
+  state.speaking = Math.max(0, state.speaking - dt);
+}
+
+/* ---------- çizim ---------- */
+function eyeGeometry() {
+  const p = state.panel;
+  const sub = state.subShift || 0;
+  const spacing = lerp(W * CFG.eyeSpacing, W * 0.075, p);
+  const baseR = Math.min(W * 0.135, H * 0.290);
+  const r = baseR * lerp(1, 0.42, p) * lerp(1, 0.88, sub);
+  const y = H * lerp(lerp(0.50, 0.420, sub), 0.118, p);
+  const driftScale = lerp(1, 0.35, p);
+  const dx = clamp(state.gaze.x, -1, 1) * W * CFG.pairDriftX * driftScale;
+  const dy = clamp(state.gaze.y, -1, 1) * H * CFG.pairDriftY * driftScale;
+  return {
+    r,
+    eyes: [
+      { x: W / 2 - spacing + dx, y: y + dy },
+      { x: W / 2 + spacing + dx, y: y + dy },
+    ],
+  };
+}
+
+function roundRect(x, y, w, h, r) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y, x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r);
+  ctx.arcTo(x, y, x + w, y, r);
+  ctx.closePath();
+}
+
+function drawReviewPanel(alpha) {
+  if (alpha < 0.01 || !qrMatrix) return;
+  const card = Math.min(W * 0.26, H * 0.46);
+  const cx = W / 2;
+  const band = Math.round(Math.min(W, H) * 0.028);
+  const top = H * 0.36;
+
+  ctx.save();
+  ctx.globalAlpha = alpha;
+
+  if (!(state.subtitle && state.voiceElapsed < state.voiceDuration + 1.2)) {
+  // üst satır (seslenecek cümle)
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'alphabetic';
+  ctx.fillStyle = '#EEEEEC';
+  ctx.font = `700 ${band}px 'Ubuntu Mono', ui-monospace, monospace`;
+  ctx.fillText('Afiyet olsun!', cx, top - band * 1.65);
+  ctx.fillStyle = '#c9b7c1';
+  ctx.font = `${Math.round(band * 0.72)}px 'Ubuntu Mono', ui-monospace, monospace`;
+  ctx.fillText('Deneyimini bizimle paylaşır mısın?', cx, top - band * 0.75);
+
+  }
+
+  // kart gölgesi + zemini
+  const cardX = cx - card / 2;
+  const cardY = top + band * 0.35;
+  ctx.shadowColor = 'rgba(233,84,32,0.35)';
+  ctx.shadowBlur = card * 0.16;
+  roundRect(cardX, cardY, card, card, card * 0.06);
+  ctx.fillStyle = '#FFFFFF';
+  ctx.fill();
+  ctx.shadowBlur = 0;
+
+  // QR modülleri
+  const pad = card * 0.075;
+  const inner = card - pad * 2;
+  const mod = inner / qrSize;
+  ctx.fillStyle = '#000000';
+  for (let y = 0; y < qrSize; y++) {
+    for (let x = 0; x < qrSize; x++) {
+      if (qrMatrix[y][x]) {
+        ctx.fillRect(cardX + pad + x * mod, cardY + pad + y * mod, mod + 0.6, mod + 0.6);
+      }
+    }
+  }
+
+  // alt yazı
+  ctx.fillStyle = '#8a7a83';
+  ctx.font = `${Math.round(band * 0.62)}px 'Ubuntu Mono', ui-monospace, monospace`;
+  ctx.fillText('kameranı QR\'a tut · Google yorum', cx, cardY + card + band * 0.95);
+  ctx.restore();
+}
+
+/* ---------- vektör göz (Vector/Cozmo tarzı) ---------- */
+const EYE = { w: 1.42, h: 1.62, tint: [51, 255, 102] };
+
+function drawGestureEye(cx, cy, r, side, pose) {
+  const affection = state.contactEmotion?.intensity || 0;
+  if (!pose && affection > .01 && !state.review) {
+    pose = { open: 1 + affection * .025, wide: 1 + affection * .025,
+      tilt: 0, x: 0, y: -affection * .025, smile: 0 };
+  }
+  if (!pose) { drawEye(cx, cy, r, side); return; }
+  ctx.save();
+  ctx.translate(cx + pose.x * r, cy + pose.y * r);
+  ctx.rotate(pose.tilt);
+  ctx.scale(pose.wide, pose.open);
+  ctx.globalAlpha *= 1 - pose.smile;
+  drawEye(0, 0, r, side);
+  ctx.restore();
+  if (pose.smile > .001) {
+    ctx.save();
+    ctx.translate(cx + pose.x * r, cy + pose.y * r);
+    ctx.rotate(pose.tilt);
+    ctx.globalAlpha = pose.smile;
+    ctx.strokeStyle = '#75ffa1';
+    ctx.lineWidth = r * .15;
+    ctx.lineCap = 'round';
+    ctx.shadowColor = '#33e866';
+    ctx.shadowBlur = r * .23;
+    ctx.beginPath();
+    ctx.moveTo(-r * .58, r * .12);
+    ctx.quadraticCurveTo(0, -r * .68, r * .58, r * .12);
+    ctx.stroke();
+    ctx.restore();
+  }
+}
+
+
+function drawEye(cx, cy, r, side) {
+  const att = state.attention;
+  const open = 1 - state.blink * 0.94;
+  const pulse = Math.max(state.greetPulse, state.voicePulse * 0.40);
+  const w = r * EYE.w * (1 + pulse * 0.035), h = r * EYE.h * (1 + pulse * 0.03);
+  const rad = Math.min(w, h) * 0.46;
+  const [tr, tg, tb] = EYE.tint;
+  const cyan = (a) => `rgba(${tr},${tg},${tb},${a})`;
+
+  // bakış
+  const gx = clamp(state.gaze.x, -1, 1) * r * 0.40;
+  const gy = clamp(state.gaze.y, -1, 1) * r * 0.30;
+
+  ctx.save();
+  ctx.translate(cx, cy);
+  ctx.scale(1, open);
+
+  // gövde + glow
+  ctx.shadowColor = cyan(0.30 + att * 0.40 + pulse * 0.25);
+  ctx.shadowBlur = r * (0.40 + att * 0.35 + pulse * 0.30);
+  roundRect(-w / 2, -h / 2, w, h, rad);
+  const body = ctx.createLinearGradient(0, -h / 2, 0, h / 2);
+  body.addColorStop(0, '#c3ffb8');
+  body.addColorStop(0.5, '#33e866');
+  body.addColorStop(1, '#0a4f27');
+  ctx.fillStyle = body;
+  ctx.fill();
+  ctx.shadowBlur = 0;
+
+  // iç gölge (cam derinliği)
+  roundRect(-w / 2 + r * 0.05, -h / 2 + r * 0.05, w - r * 0.10, h - r * 0.10, rad * 0.92);
+  const inner = ctx.createLinearGradient(0, -h / 2, 0, h / 2);
+  inner.addColorStop(0, 'rgba(6,36,20,0.25)');
+  inner.addColorStop(0.45, 'rgba(4,26,14,0.55)');
+  inner.addColorStop(1, 'rgba(3,16,9,0.80)');
+  ctx.fillStyle = inner;
+  ctx.fill();
+
+  // bebek + iris (kırpılmış alan)
+  ctx.save();
+  roundRect(-w / 2 + r * 0.09, -h / 2 + r * 0.09, w - r * 0.18, h - r * 0.18, rad * 0.86);
+  ctx.clip();
+
+  ctx.translate(gx, gy);
+  const iris = ctx.createRadialGradient(0, 0, r * 0.02, 0, 0, r * 0.44);
+  iris.addColorStop(0, 'rgba(2,14,20,0.95)');
+  iris.addColorStop(0.7, 'rgba(2,14,20,0.55)');
+  iris.addColorStop(1, 'rgba(2,14,20,0)');
+  ctx.fillStyle = iris;
+  ctx.beginPath(); ctx.arc(0, 0, r * 0.44, 0, Math.PI * 2); ctx.fill();
+
+  // iris halkası
+  ctx.beginPath(); ctx.arc(0, 0, r * (0.245 + state.pupil * 0.02), 0, Math.PI * 2);
+  ctx.strokeStyle = cyan(0.35 + att * 0.30);
+  ctx.lineWidth = Math.max(1, r * 0.014); ctx.stroke();
+
+  // bebek
+  const pupR = r * (0.125 + state.pupil * 0.105);
+  ctx.beginPath(); ctx.arc(0, 0, pupR, 0, Math.PI * 2);
+  ctx.fillStyle = 'rgba(1,10,14,0.97)'; ctx.fill();
+
+  // parlama: bakışla birlikte bebeğin içinde kayar (specular kayması)
+  const gxe = clamp(state.gaze.x, -1, 1), gye = clamp(state.gaze.y, -1, 1);
+  let hx = -gxe * pupR * 0.40 - pupR * 0.10;
+  let hy = -gye * pupR * 0.34 - pupR * 0.22;
+  const hd = Math.hypot(hx, hy);
+  const hLim = pupR * 0.62;
+  if (hd > hLim) { hx = (hx / hd) * hLim; hy = (hy / hd) * hLim; }
+  const hR = pupR * (0.30 + state.pupil * 0.06);
+  ctx.beginPath(); ctx.arc(hx, hy, hR, 0, Math.PI * 2);
+  ctx.fillStyle = 'rgba(255,255,255,0.90)'; ctx.fill();
+  // ikinci küçük kırılma
+  ctx.beginPath();
+  ctx.arc(hx + hR * 1.15, hy + hR * 0.95, hR * 0.42, 0, Math.PI * 2);
+  ctx.fillStyle = 'rgba(255,255,255,0.32)'; ctx.fill();
+
+  ctx.restore();
+
+  // cam parlaması (üst sol)
+  ctx.save();
+  roundRect(-w / 2, -h / 2, w, h, rad);
+  ctx.clip();
+  const gloss = ctx.createRadialGradient(-w * 0.28, -h * 0.36, r * 0.02, -w * 0.28, -h * 0.36, h * 0.55);
+  gloss.addColorStop(0, 'rgba(255,255,255,0.28)');
+  gloss.addColorStop(0.5, 'rgba(255,255,255,0.05)');
+  gloss.addColorStop(1, 'rgba(255,255,255,0)');
+  ctx.fillStyle = gloss;
+  ctx.fillRect(-w / 2, -h / 2, w, h);
+  ctx.restore();
+
+  // squint: dinlenirken hafif kapak
+  const squint = (1 - att) * h * 0.11 + h * 0.012 - clamp(state.gaze.y, -1, 1) * h * 0.035;
+  if (squint > 0.5) {
+    ctx.save();
+    roundRect(-w / 2, -h / 2, w, h, rad);
+    ctx.clip();
+    const hood = ctx.createLinearGradient(0, -h / 2, 0, -h / 2 + squint * 2.2);
+    hood.addColorStop(0, 'rgba(4,16,24,0.80)');
+    hood.addColorStop(0.55, 'rgba(4,16,24,0.35)');
+    hood.addColorStop(1, 'rgba(4,16,24,0)');
+    ctx.fillStyle = hood;
+    ctx.fillRect(-w / 2, -h / 2, w, squint * 2.2);
+    ctx.restore();
+  }
+
+  ctx.restore();
+
+  // dış kenar
+  roundRect(cx - w / 2, cy - h / 2, w, h, rad);
+  ctx.strokeStyle = cyan(0.22 + att * 0.33);
+  ctx.lineWidth = Math.max(1, r * 0.028);
+  ctx.stroke();
+
+  // kırpma çizgisi
+  if (state.blink > 0.35) {
+    const t = (state.blink - 0.35) / 0.65;
+    ctx.beginPath();
+    ctx.moveTo(cx - w * 0.42, cy);
+    ctx.lineTo(cx + w * 0.42, cy);
+    ctx.strokeStyle = cyan(0.10 + t * 0.45);
+    ctx.lineWidth = Math.max(1, r * 0.02);
+    ctx.stroke();
+  }
+}
+
+function drawReadout(eyes, r) {
+  if (state.idlePose) return;
+  if (state.subtitle && state.voiceElapsed < state.voiceDuration + 1.2) return;
+  if (state.panel > 0.15) return;
+  const fs = Math.max(10, Math.round(r * 0.15));
+  const y = eyes[0].y + r * 1.85;
+  const lock = state.attention > 0.5;
+  const pct = Math.round(state.attention * 100);
+  const line = lock
+    ? 'TRACKING ' + String(pct).padStart(2, '0') + '%  ·  TGT ' +
+      (state.gazeTarget.x >= 0 ? '+' : '') + state.gazeTarget.x.toFixed(2) + ' ' +
+      (state.gazeTarget.y >= 0 ? '+' : '') + state.gazeTarget.y.toFixed(2)
+    : 'IDLE  ·  SCAN';
+  ctx.save();
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.font = fs + 'px "Ubuntu Mono", ui-monospace, monospace';
+  ctx.fillStyle = lock ? 'rgba(51,255,102,0.70)' : 'rgba(238,238,236,0.28)';
+  ctx.fillText(line, W / 2, y);
+  // blok imleç
+  ctx.fillStyle = 'rgba(51,255,102,' + (lock ? 0.7 : 0.25) + ')';
+  const blinkOn = Math.floor(state.t * 2) % 2 === 0;
+  if (blinkOn) ctx.fillRect(W / 2 + ctx.measureText(line).width / 2 + fs * 0.4, y - fs * 0.42, fs * 0.5, fs * 0.84);
+  ctx.restore();
+}
+
+function drawSubtitle() {
+  if (!state.subtitle || state.voiceElapsed < 0) return;
+  const age = state.voiceElapsed;
+  const left = state.voiceDuration + 1.2 - age;
+  if (left <= 0) return;
+  const panel = state.panel > .15;
+  const fontSize = Math.round(clamp(Math.min(W, H) * (panel ? .035 : .057), 12, panel ? 29 : 48));
+  const lineHeight = fontSize * 1.28;
+  const maxWidth = W * (panel ? .84 : .76);
+  if (!state.subLayout || state.subLayout.w !== W || state.subLayout.fs !== fontSize || state.subLayout.panel !== panel) {
+    ctx.save();
+    ctx.font = '700 ' + fontSize + 'px "Ubuntu Mono", ui-monospace, monospace';
+    const space = ctx.measureText(' ').width;
+    const lines = [];
+    let words = [], width = 0;
+    for (const caption of state.captionWords) {
+      const wordWidth = ctx.measureText(caption.text).width;
+      if (width + wordWidth > maxWidth && words.length) {
+        lines.push({ words, width: width - space });
+        words = []; width = 0;
+      }
+      words.push({ ...caption, width: wordWidth });
+      width += wordWidth + space;
+    }
+    if (words.length) lines.push({ words, width: width - space });
+    state.subLayout = { w: W, fs: fontSize, panel, lines, space };
+    ctx.restore();
+  }
+  const layout = state.subLayout;
+  const totalHeight = layout.lines.length * lineHeight + fontSize * .7;
+  const top = H * (panel ? .265 : .835) - totalHeight / 2;
+  let shownLines = 0;
+  layout.lines.forEach((line, index) => {
+    if (line.words.some(word => age >= word.at)) shownLines = index + 1;
+  });
+  if (!shownLines) return;
+  const boxWidth = Math.min(W * .94, Math.max(...layout.lines.map(line => line.width)) + fontSize * 1.4);
+  const opacity = Math.min(1, age / .09, left / .3);
+  ctx.save();
+  ctx.globalAlpha = opacity;
+  roundRect(W / 2 - boxWidth / 2, top, boxWidth, shownLines * lineHeight + fontSize * .7, fontSize * .30);
+  ctx.fillStyle = 'rgba(3,16,8,.80)';
+  ctx.fill();
+  ctx.strokeStyle = 'rgba(51,255,102,.35)';
+  ctx.lineWidth = 1;
+  ctx.stroke();
+  ctx.font = '700 ' + fontSize + 'px "Ubuntu Mono", ui-monospace, monospace';
+  ctx.textAlign = 'left';
+  ctx.textBaseline = 'middle';
+  layout.lines.forEach((line, index) => {
+    const y = top + fontSize * .35 + lineHeight * (index + .5);
+    let x = (W - line.width) / 2;
+    for (const word of line.words) {
+      if (age >= word.at) {
+        ctx.globalAlpha = opacity * Math.min(1, (age - word.at) / .06);
+        ctx.fillStyle = age - word.at < .25 ? '#baffce' : '#eafff0';
+        ctx.fillText(word.text, x, y);
+      }
+      x += word.width + layout.space;
+    }
+  });
+  ctx.restore();
+}
+
+function draw(now) {
+  try { drawScene(now); } catch (err) {
+    if (!draw.err) { draw.err = 1; console.error('[draw] ' + (err && err.message)); }
+  }
+}
+
+let cachedBackground = null;
+function drawCachedBackground() {
+  if (!cachedBackground || cachedBackground.width !== canvas.width || cachedBackground.height !== canvas.height) {
+    cachedBackground = document.createElement('canvas');
+    cachedBackground.width = canvas.width;
+    cachedBackground.height = canvas.height;
+    const backgroundContext = cachedBackground.getContext('2d', { alpha: false });
+    backgroundContext.setTransform(DPR, 0, 0, DPR, 0, 0);
+  // arka plan
+  const bg = backgroundContext.createRadialGradient(W / 2, H * 0.45, H * 0.1, W / 2, H * 0.5, Math.max(W, H) * 0.85);
+  bg.addColorStop(0, '#180512');
+  bg.addColorStop(0.55, '#0d0209');
+  bg.addColorStop(1, '#050103');
+  backgroundContext.fillStyle = bg;
+  backgroundContext.fillRect(0, 0, W, H);
+
+  // çok hafif tarama dokusu
+  backgroundContext.save();
+  backgroundContext.globalAlpha = 0.04;
+  backgroundContext.fillStyle = '#E95420';
+  const step = 4;
+  for (let y = 0; y < H; y += step * 3) backgroundContext.fillRect(0, y, W, 1);
+  backgroundContext.restore();
+
+
+  }
+  ctx.drawImage(cachedBackground, 0, 0, W, H);
+}
+
+function drawScene(now) {
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+
+  drawCachedBackground();
+
+  const { r, eyes } = eyeGeometry();
+  drawGestureEye(eyes[0].x, eyes[0].y, r, -1, state.idlePose?.eyes[0]);
+  drawGestureEye(eyes[1].x, eyes[1].y, r, +1, state.idlePose?.eyes[1]);
+  drawIdleAccents(ctx, W, H, state.idlePose);
+  drawContactHearts(ctx, eyes, r, state.contactEmotion, state.panel);
+  drawReadout(eyes, r);
+  drawCalibHint();
+  drawReviewPanel(state.panel);
+  drawSubtitle();
+
+  // nefes/glow
+  const pulse = 0.5 + 0.5 * Math.sin(state.t * 1.1);
+  ctx.save();
+  ctx.globalCompositeOperation = 'lighter';
+  const glow = ctx.createRadialGradient(W / 2, H * 0.52, r * 1.2, W / 2, H * 0.52, r * 3.4);
+  glow.addColorStop(0, 'rgba(51,255,102,' + (0.02 + state.attention * 0.05 + pulse * 0.015) + ')');
+  glow.addColorStop(1, 'rgba(51,255,102,0)');
+  ctx.fillStyle = glow;
+  ctx.fillRect(0, 0, W, H);
+  ctx.restore();
+}
+
+/* ---------- döngü ---------- */
+function resize() {
+  DPR = Math.min(2, window.devicePixelRatio || 1);
+  W = window.innerWidth; H = window.innerHeight;
+  canvas.width = Math.round(W * DPR);
+  canvas.height = Math.round(H * DPR);
+}
+
+function frame(now) {
+  const dt = Math.min(0.05, (now - state.lastFrame) / 1000);
+  state.lastFrame = now;
+  frameCount++;
+  if (now - fpsAt > 1000) {
+    stat.fps = Math.round((frameCount * 1000) / (now - fpsAt));
+    frameCount = 0;
+    fpsAt = now;
+  }
+  detectFace(now);
+  update(dt);
+  draw(now);
+  drawDebug();
+  requestAnimationFrame(frame);
+}
+
+function drawCalibHint() {
+  if (!CALIB_ON) return;
+  if (!drawCalibHint.logged) {
+    drawCalibHint.logged = true;
+    console.log('[calibhint] W=' + W + ' H=' + H + ' dpr=' + DPR + ' cx=' + CAL.cx.toFixed(2)
+      + ' css=' + canvas.clientWidth + 'x' + canvas.clientHeight + ' dev=' + canvas.width + 'x' + canvas.height);
+  }
+  const fs = Math.max(12, Math.round(Math.min(W, H) * 0.018));
+  ctx.save();
+  ctx.textAlign = 'left';
+  ctx.textBaseline = 'bottom';
+  ctx.font = fs + 'px "Ubuntu Mono", monospace';
+  ctx.fillStyle = 'rgba(138,226,52,0.85)';
+  ctx.fillText('kalibre  cx=' + CAL.cx.toFixed(3) + '  cy=' + CAL.cy.toFixed(3)
+    + '  n=' + CAL.n + '/' + CAL.maxN + (CAL.locked ? '  KİLİTLİ' : '  öğreniyor'), 16, H - 16);
+  ctx.fillStyle = 'rgba(238,238,236,0.45)';
+  ctx.fillText('dokun: merkezi şu ana al · uzun bas: sıfırla', 16, H - 16 - fs * 1.4);
+  ctx.restore();
+}
+
+function drawDebug() {
+  if (!DEBUG) return;
+  const pad = 14, lh = 20, fs = 15;
+  ctx.save();
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  ctx.fillStyle = 'rgba(0,0,0,0.65)';
+  ctx.fillRect(0, 0, 620, lh * 12 + pad * 2);
+  ctx.fillStyle = '#8AE234';
+  ctx.font = `${fs}px 'Ubuntu Mono', monospace`;
+  ctx.textAlign = 'left';
+  ctx.textBaseline = 'top';
+  const lines = [
+    'model: ' + stat.model + (stat.err ? ' / ' + stat.err : ''),
+    'kamera: ' + (stat.cam || '—') + '  fps: ' + stat.fps,
+    'yüz: ' + (stat.face ? 'VAR w=' + (state.face ? state.face.w.toFixed(2) : '?') : 'yok') +
+      '  tespit: ' + stat.detMs + ' ms  eşik ' + CFG.counterWidth.toFixed(2),
+    'bakış hedefi: ' + state.gazeTarget.x.toFixed(2) + ', ' + state.gazeTarget.y.toFixed(2),
+    'göz: ' + state.gaze.x.toFixed(2) + ', ' + state.gaze.y.toFixed(2),
+    'son söz: ' + (state.lastPhrase || '—'),
+    'müşteri bakışı: ' + (state.customerGaze
+      ? state.customerGaze.yaw.toFixed(2) + ', ' + state.customerGaze.pitch.toFixed(2)
+      : '—') + (state.eyeContact ? '  · GÖZ TEMASI' : ''),
+    'bebek: ' + state.pupil.toFixed(2) + '  sakkad: ' + state.gaze.x.toFixed(2) + ',' + state.gaze.y.toFixed(2),
+    'ses: ' + lastVoiceSrc + (audioUnlocked ? '  (kilit açık)' : '  (dokun)'),
+    'kalibre: cx=' + CAL.cx.toFixed(2) + ' cy=' + CAL.cy.toFixed(2) + ' n=' + CAL.n + (CAL.locked ? ' KİLİTLİ' : ' açık'),
+    'diyalog: ' + (DIALOGS ? Object.keys(DIALOGS).length + ' kategori / ' + Object.keys(clips).length + ' klip' : 'yükleniyor'),
+    'köprü: ' + bridgeState,
+    'hata: ' + (stat.err || '—'),
+  ];
+  lines.forEach((t, i) => ctx.fillText(t, pad, pad + i * lh));
+
+  // aynalı kamera önizleme
+  if (camReady && video && video.videoWidth) {
+    const pw = 320, ph = Math.round(pw * video.videoHeight / video.videoWidth);
+    const px0 = W - pw - pad, py0 = pad;
+    ctx.save();
+    ctx.globalAlpha = 0.85;
+    ctx.translate(px0 + pw, py0);
+    ctx.scale(-1, 1);
+    ctx.drawImage(video, 0, 0, pw, ph);
+    ctx.restore();
+    if (state.face) {
+      const fx = px0 + (1 - state.face.cx) * pw;
+      const fy = py0 + state.face.cy * ph;
+      const fw = state.face.w * pw, fh = state.face.h * ph;
+      ctx.strokeStyle = '#E95420'; ctx.lineWidth = 2;
+      ctx.strokeRect(fx - fw / 2, fy - fh / 2, fw, fh);
+      ctx.fillStyle = '#8AE234';
+      ctx.beginPath();
+      ctx.arc(px0 + (1 - state.face.x) * pw, py0 + state.face.y * ph, 4, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    ctx.strokeStyle = 'rgba(238,238,236,0.3)';
+    ctx.strokeRect(px0, py0, pw, ph);
+  }
+  ctx.restore();
+}
+
+/* ---------- giriş ---------- */
+window.addEventListener('resize', resize);
+window.addEventListener('keydown', (e) => {
+  const k = e.key.toLowerCase();
+  if (k === 'c') {
+    if (camReady) {
+      stream?.getTracks().forEach((t) => t.stop());
+      camReady = false; stat.face = false; state.face = null;
+      lockedFace = null;
+      statusTick(true);
+    } else {
+      initCamera();
+    }
+  }
+  if (k === 'p') togglePill();
+  if (k === 'd') { state.gazeTarget.x = Math.random() * 2 - 1; state.gazeTarget.y = Math.random() * 1.2 - 0.6; }
+  if (k === 'b') state.blink = 1;
+  if (k === 'r') { state.review ? hideReview() : showReview(); }
+  if (k.startsWith('arrow')) {
+    const map = { arrowleft: [-1, 0], arrowright: [1, 0], arrowup: [0, -1], arrowdown: [0, 1] };
+    const [dx, dy] = map[k] || [0, 0];
+    state.gazeTarget.x = clamp(state.gazeTarget.x + dx * 1.1, -1, 1);
+    state.gazeTarget.y = clamp(state.gazeTarget.y + dy * 1.1, -1, 1);
+    state.nextSaccade = state.t + 4;
+    e.preventDefault();
+  }
+});
+document.addEventListener('pointerdown', () => {
+  unlockAudio();
+  if (CALIB_ON && state.face) {
+    CAL.cx = state.face.x;
+    CAL.cy = state.face.y;
+    CAL.n = CAL.maxN;
+    CAL.locked = true;
+    saveCal();
+    console.log('[calib] elle merkez cx=' + CAL.cx.toFixed(3) + ' cy=' + CAL.cy.toFixed(3) + ' (kilitli)');
+    return;
+  }
+  if (state.review) hideReview(); else togglePill();
+}, { once: false });
+
+document.addEventListener('contextmenu', (e) => {
+  if (!CALIB_ON) return;
+  e.preventDefault();
+  CAL.cx = 0.5; CAL.cy = 0.42; CAL.n = 0; CAL.locked = false; CAL.stable = 0; saveCal();
+  console.log('[calib] sıfırlandı, yeniden öğrenecek');
+});
+
+resize();
+connectBridge();
+loadDialogs();
+
+/* kalibrasyon: yüz genişliğini sunucuya bildir (sadece ?calib=1 veya debug) */
+if (QS.has('calreset')) {
+  CAL.cx = 0.5; CAL.cy = 0.42; CAL.n = 0; CAL.locked = false; CAL.stable = 0;
+  saveCal();
+  console.log('[calib] calreset: sıfırlandı');
+}
+
+
+const CALIB_ON = QS.has('calib');
+console.log('[calib] overlay=' + CALIB_ON + ' search=' + location.search);
+requestAnimationFrame(frame);
+// kamera izni kullanıcı etkileşimi olmadan da sorulabilir; sorun olursa 'c' ile aç.
+setTimeout(() => { initCamera(); }, 900);
+
+// ?demo=review → QR panelini denemek için
+const qs = QS;
+if (qs.get('demo') === 'review') setTimeout(showReview, 1200);
+for (const cat of ['idle', 'stare', 'counter', 'passerby']) {
+  if (qs.get('demo') === cat) setTimeout(() => {
+    const line = pickLine(cat);
+    if (!line) return;
+    speak(line, cat === 'idle' ? { volume: 0.55 } : undefined);
+    state.lastPhrase = line;
+    state.lastPhraseAt = state.t;
+  }, 1200);
+}
+if (qs.get('demo') === 'greet') setTimeout(() => {
+  greet.seenAt = state.t - 2; greet.maxW = 0.12; greet.done = false;
+  state.face = { x: 0.5, y: 0.42, w: 0.12, h: 0.16 };
+  state.faceSeenAt = state.t;
+  tryGreet();
+}, 1400);
+if (qs.get('panel') === '1') { state.review = true; state.panel = 1; state.reviewUntil = 1e9; }
+</script>
+</body>
+</html>
+
